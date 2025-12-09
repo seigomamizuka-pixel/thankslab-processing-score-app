@@ -3,8 +3,16 @@ import pandas as pd
 import numpy as np
 
 
-st.set_page_config(page_title="業務処理能力 可視化ダッシュボード", layout="wide")
-st.title("就労継続支援A型・B型 業務処理能力 可視化ダッシュボード")
+# ページ設定（タイトル変更）
+st.set_page_config(page_title="処理スコアダッシュボード📝", layout="wide")
+
+# 左にロゴ、右にタイトル
+logo_col, title_col = st.columns([1, 5])
+with logo_col:
+    # app.py と同じフォルダに「ロゴ_NEW_横.png」を置いてください
+    st.image("ロゴ_NEW_横.png", use_column_width=True)
+with title_col:
+    st.title("処理スコアダッシュボード📝")
 
 st.markdown(
     """
@@ -225,9 +233,10 @@ def compute_all(report_df: pd.DataFrame, assign_df: pd.DataFrame,案件_df: pd.D
 
 st.sidebar.header("1. CSVアップロード")
 
-report_file = st.sidebar.file_uploader("① 業務日報CSV（業務日報マスタ3 - 11月(portal)）", type=["csv"])
-assign_file = st.sidebar.file_uploader("② 業務割り振りCSV（ポータル業務報告…業務振り分け一覧）", type=["csv"])
-案件_file = st.sidebar.file_uploader("③ 案件管理CSV（案件管理シート…業務管理シート）", type=["csv"])
+# ラベル文言をシンプルに修正
+report_file = st.sidebar.file_uploader("① 業務日報CSV", type=["csv"])
+assign_file = st.sidebar.file_uploader("② 業務割り振りCSV", type=["csv"])
+案件_file = st.sidebar.file_uploader("③ 案件管理CSV", type=["csv"])
 
 if not (report_file and assign_file and 案件_file):
     st.info("左のサイドバーから 3つのCSV をすべてアップロードしてください。")
