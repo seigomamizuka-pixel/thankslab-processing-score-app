@@ -13,9 +13,10 @@ st.title("処理スコアダッシュボード📝")
 st.markdown(
     """
 ### 使い方
-1. ①業務日報（複数月分OK） ②業務割り振り ③案件管理 のCSVをアップロード  
+1. ①業務日報（複数月分OK） ②業務割り振り ③案件管理 ④タレントデータ のCSVをアップロード  
 2. 「詳細表示する月」で、タスク別 / 利用者別の表示対象の月を切り替え  
-3. 「全体集計」タブで、月ごとの処理スコアを比較
+3. 「在籍日数でフィルタする」をONにし、スライダーで在籍日数（日）を指定  
+4. 「全体集計」タブで、月ごとの処理スコアを比較
 """
 )
 
@@ -97,27 +98,75 @@ def calc_deviation_by_task(df, value_col, group_col="task_id"):
 
 
 # ---------------------------------------------------------
-# 1ヶ月分の全集計ロジック
+# タレントデータから「その月末時点で在籍◯日以内」の社員コードを取得
 # ---------------------------------------------------------
-def compute_all(report_df, assign_df, 案件_df, period_str):
+def prepare_talent_for_period(talent_df, period_str, max_days):
     """
-    report_df：複数月分を含む日報全体
-    period_str：'YYYY-MM' 形式の集計対象月
+    period_str: 'YYYY-MM'
+    max_days : 180 など
+    戻り値: その月末時点で在籍 max_days 日以内の社員コード集合（set[str]）
+    """
+    if talent_df is None or max_days is None:
+        return None
+
+    # 必要な列がない場合はフィルタを諦める
+    if "業務情報_入社・退職_入社日" not in talent_df.columns or "社員コード" not in talent_df.columns:
+        return None
+
+    df = talent_df.copy()
+    df["業務情報_入社・退職_入社日"] = pd.to_datetime(df["業務情報_入社・退職_入社日"], errors="coerce")
+    df = df.dropna(subset=["業務情報_入社・退職_入社日"])
+
+    # 社員コードごとに最も古い入社日（重複行対策）
+    df = df.sort_values(["社員コード", "業務情報_入社・退職_入社日"])
+    df_min = df.groupby("社員コード", as_index=False)["業務情報_入社・退職_入社日"].min()
+
+    # 対象月の月末日
+    period = pd.Period(period_str, freq="M")
+    period_end = period.to_timestamp(how="end")  # 例: 2024-10 → 2024-10-31
+
+    df_min["days"] = (period_end - df_min["業務情報_入社・退職_入社日"]).dt.days
+
+    # 0〜max_days 日の人だけ
+    cond = (df_min["days"] >= 0) & (df_min["days"] <= max_days)
+    allowed = set(df_min.loc[cond, "社員コード"].astype(str))
+    return allowed
+
+
+# ---------------------------------------------------------
+# 1ヶ月分の全集計ロジック（タレント & 在籍日フィルタ付き）
+# ---------------------------------------------------------
+def compute_all(report_df, assign_df, 案件_df, period_str, talent_df=None, tenure_days=None):
+    """
+    report_df : 複数月分を含む日報全体
+    period_str: 'YYYY-MM'
+    talent_df  : タレントデータ（社員コード・入社日を含む）
+    tenure_days: 在籍日数の上限（例: 180） / Noneならフィルタなし
     """
     df_rep = report_df.copy()
 
-    # 日付処理
+    # 日付処理 & 対象月抽出
     df_rep["日付"] = pd.to_datetime(df_rep["日付"], errors="coerce")
     target_period = pd.to_datetime(period_str + "-01")
     df_rep = df_rep[df_rep["日付"].dt.to_period("M") == target_period.to_period("M")]
 
+    # 対象月にデータがない場合
     if df_rep.empty:
-        # 対象月にデータがない場合は空の結果を返す
-        empty_cols = ["employee_code", "user_name", "organization_name",
-                      "task_id", "task_name", "task_status",
-                      "案件種別", "業務グループ",
-                      "rank", "rank_value", "monthly_count",
-                      "deviation", "processing_score"]
+        empty_cols = [
+            "employee_code",
+            "user_name",
+            "organization_name",
+            "task_id",
+            "task_name",
+            "task_status",
+            "案件種別",
+            "業務グループ",
+            "rank",
+            "rank_value",
+            "monthly_count",
+            "deviation",
+            "processing_score",
+        ]
         base_empty = pd.DataFrame(columns=empty_cols)
 
         user_empty = pd.DataFrame(
@@ -147,7 +196,7 @@ def compute_all(report_df, assign_df, 案件_df, period_str):
 
         return base_empty, user_empty, summary, org_summary
 
-    # 日報の集計
+    # 日報の集計（利用者×タスクID×月）
     df_rep = df_rep[~df_rep["タスクID"].isna()]
     df_rep["タスクID"] = df_rep["タスクID"].astype(int)
     df_rep["件数"] = pd.to_numeric(df_rep["件数"], errors="coerce").fillna(0)
@@ -158,10 +207,21 @@ def compute_all(report_df, assign_df, 案件_df, period_str):
         .rename(columns={"件数": "monthly_count"})
     )
 
-    # 業務割り振りと案件管理を結合
     df_assign2 = assign_df.copy()
     案件_df2 = 案件_df[["タスクID", "案件種別", "業務グループ"]].drop_duplicates()
 
+    # 🔹 在籍日数フィルタ（タレントデータ）
+    allowed_codes = None
+    if talent_df is not None and tenure_days is not None:
+        allowed_codes = prepare_talent_for_period(talent_df, period_str, tenure_days)
+        if allowed_codes is not None and len(allowed_codes) > 0:
+            df_assign2["employee_code"] = df_assign2["employee_code"].astype(str)
+            monthly["利用者コード"] = monthly["利用者コード"].astype(str)
+
+            df_assign2 = df_assign2[df_assign2["employee_code"].isin(allowed_codes)]
+            monthly = monthly[monthly["利用者コード"].isin(allowed_codes)]
+
+    # 業務割り振り × 案件情報 × 日報集計 の結合
     base = df_assign2.merge(
         案件_df2, left_on="task_id", right_on="タスクID", how="left"
     ).merge(
@@ -173,14 +233,57 @@ def compute_all(report_df, assign_df, 案件_df, period_str):
 
     base["monthly_count"] = base["monthly_count"].fillna(0)
 
-    # ランク付与
+    # フィルタの結果、対象がいなくなった場合
+    if base.empty:
+        empty_cols = [
+            "employee_code",
+            "user_name",
+            "organization_name",
+            "task_id",
+            "task_name",
+            "task_status",
+            "案件種別",
+            "業務グループ",
+            "rank",
+            "rank_value",
+            "monthly_count",
+            "deviation",
+            "processing_score",
+        ]
+        base_empty = pd.DataFrame(columns=empty_cols)
+
+        user_empty = pd.DataFrame(
+            columns=[
+                "employee_code",
+                "user_name",
+                "organization_name",
+                "total_processing_score",
+                "task_ranks",
+                "user_rank",
+            ]
+        )
+
+        summary = {"overall_mean": np.nan, "overall_median": np.nan}
+        org_summary = pd.DataFrame(
+            columns=[
+                "organization_name",
+                "avg_score",
+                "user_count",
+                "ratio_A",
+                "ratio_B",
+                "ratio_C",
+                "ratio_D",
+                "ratio_E",
+            ]
+        )
+
+        return base_empty, user_empty, summary, org_summary
+
+    # ランク・偏差値・処理スコア
     base["rank"] = base.apply(assign_rank, axis=1)
     base["rank_value"] = base["rank"].map(RANK_VALUE)
 
-    # 偏差値
     base["deviation"] = calc_deviation_by_task(base, "monthly_count")
-
-    # 処理スコア
     base["processing_score"] = base["rank_value"] * base["deviation"]
 
     # -----------------------------------------------------
@@ -197,7 +300,6 @@ def compute_all(report_df, assign_df, 案件_df, period_str):
         .apply(lambda s: ", ".join(sorted(s.dropna().unique())))
         .reset_index(name="task_ranks")
     )
-
     user_df = user_df.merge(rank_list, on=["employee_code", "user_name", "organization_name"], how="left")
 
     # 個人最高ランク
@@ -213,7 +315,6 @@ def compute_all(report_df, assign_df, 案件_df, period_str):
         .apply(best_rank)
         .reset_index(name="user_rank")
     )
-
     user_df = user_df.merge(best_rank_df, on=["employee_code", "user_name", "organization_name"], how="left")
 
     # -----------------------------------------------------
@@ -229,21 +330,25 @@ def compute_all(report_df, assign_df, 案件_df, period_str):
         .agg(avg_score=("total_processing_score", "mean"), user_count=("employee_code", "nunique"))
     )
 
-    rank_pivot = (
-        user_df.pivot_table(
-            index="organization_name",
-            columns="user_rank",
-            values="employee_code",
-            aggfunc=pd.Series.nunique,
-            fill_value=0,
+    # 拠点×ランクの人数 → 割合
+    if not user_df.empty:
+        rank_pivot = (
+            user_df.pivot_table(
+                index="organization_name",
+                columns="user_rank",
+                values="employee_code",
+                aggfunc=pd.Series.nunique,
+                fill_value=0,
+            )
+            .reset_index()
         )
-        .reset_index()
-    )
-
-    org_summary = org_summary.merge(rank_pivot, on="organization_name", how="left")
+        org_summary = org_summary.merge(rank_pivot, on="organization_name", how="left")
+    else:
+        for r in ["A", "B", "C", "D", "E"]:
+            org_summary[r] = 0
 
     for r in ["A", "B", "C", "D", "E"]:
-        org_summary[f"ratio_{r}"] = org_summary.get(r, 0) / org_summary["user_count"]
+        org_summary[f"ratio_{r}"] = org_summary.get(r, 0) / org_summary["user_count"].replace(0, np.nan)
 
     return base, user_df, summary, org_summary
 
@@ -261,12 +366,26 @@ report_files = st.sidebar.file_uploader(
 )
 assign_file = st.sidebar.file_uploader("② 業務割り振りCSV", type=["csv"])
 案件_file = st.sidebar.file_uploader("③ 案件管理CSV", type=["csv"])
+talent_file = st.sidebar.file_uploader("④ タレントデータCSV（在籍日数フィルタ用・任意）", type=["csv"])
+
+# 在籍フィルタON/OFF + 日数指定スライダー
+st.sidebar.header("2. 在籍日数フィルタ")
+filter_by_tenure = st.sidebar.checkbox("在籍日数でフィルタする", value=False)
+tenure_days = None
+if filter_by_tenure:
+    tenure_days = st.sidebar.slider(
+        "対象とする在籍日数（その月末時点・日数）",
+        min_value=30,
+        max_value=730,
+        value=180,
+        step=30,
+    )
 
 if not report_files or not assign_file or not 案件_file:
     st.info("左のサイドバーから ①〜③ すべてのCSVをアップロードしてください。")
     st.stop()
 
-# 日報複数ファイルを結合
+# 日報: 複数ファイルを結合
 report_dfs = []
 for f in report_files:
     df_tmp = load_csv(f)
@@ -279,12 +398,17 @@ if not report_dfs:
 
 df_report_all = pd.concat(report_dfs, ignore_index=True)
 
-# その他2つ
+# その他CSV
 df_assign = load_csv(assign_file)
 df_案件 = load_csv(案件_file)
 
 if df_assign is None or df_案件 is None:
     st.stop()
+
+# タレントCSV（任意）
+talent_df = None
+if talent_file is not None:
+    talent_df = load_csv(talent_file)
 
 # ---------------------------------------------------------
 # 利用可能な月一覧の取得
@@ -300,10 +424,18 @@ periods = sorted(valid_dates.dt.to_period("M").astype(str).unique())
 
 # 詳細表示する月（タスク別・利用者別用）
 selected_period = st.sidebar.selectbox(
-    "2. 詳細表示する月（タスク別・利用者別）", periods, index=len(periods) - 1
+    "3. 詳細表示する月（タスク別・利用者別）", periods, index=len(periods) - 1
 )
 
-st.sidebar.write("※ 全体集計タブでは、アップロードされたすべての月を比較表示します。")
+# 在籍フィルタの状態表示
+if filter_by_tenure and tenure_days is not None:
+    if talent_df is None:
+        st.sidebar.error("在籍日数フィルタを使うには、④タレントデータCSVをアップロードしてください。フィルタは無効として集計します。")
+    else:
+        st.sidebar.success(f"在籍{tenure_days}日以内の利用者に絞って集計します。")
+else:
+    st.sidebar.info("在籍日数によるフィルタは行わず、全利用者を対象に集計します。")
+
 
 # ---------------------------------------------------------
 # 各月ごとの集計をまとめて計算
@@ -312,7 +444,12 @@ results_by_period = {}
 
 for p in periods:
     base_df_p, user_df_p, summary_p, org_summary_p = compute_all(
-        df_report_all, df_assign, df_案件, p
+        df_report_all,
+        df_assign,
+        df_案件,
+        p,
+        talent_df=talent_df if (filter_by_tenure and tenure_days is not None) else None,
+        tenure_days=tenure_days if (filter_by_tenure and tenure_days is not None) else None,
     )
     results_by_period[p] = {
         "base": base_df_p,
@@ -321,7 +458,7 @@ for p in periods:
         "org_summary": org_summary_p,
     }
 
-# 表示用に、選択された月のデータを取り出す
+# 表示用: 選択された月のデータ
 base_df = results_by_period[selected_period]["base"]
 user_df = results_by_period[selected_period]["user"]
 summary_selected = results_by_period[selected_period]["summary"]
@@ -339,7 +476,10 @@ tab1, tab2, tab3 = st.tabs(["タスク別処理状況", "利用者別集計", "�
 # ---------------------------------------------------------
 with tab1:
     st.subheader(f"タスク別処理状況（{selected_period}）")
-    st.caption("※ サイドバーの月選択で切り替えられます。")
+    if filter_by_tenure and tenure_days is not None and talent_df is not None:
+        st.caption(f"※ この月末時点で在籍{tenure_days}日以内の利用者のみを対象として集計しています。")
+    else:
+        st.caption("※ 在籍日数によるフィルタなし（またはタレントデータ未アップロード）の全利用者を対象としています。")
 
     show_cols = [
         "employee_code",
@@ -369,7 +509,10 @@ with tab1:
 # ---------------------------------------------------------
 with tab2:
     st.subheader(f"利用者別 集計結果（{selected_period}）")
-    st.caption("※ サイドバーの月選択で切り替えられます。")
+    if filter_by_tenure and tenure_days is not None and talent_df is not None:
+        st.caption(f"※ この月末時点で在籍{tenure_days}日以内の利用者のみを対象として集計しています。")
+    else:
+        st.caption("※ 在籍日数によるフィルタなし（またはタレントデータ未アップロード）の全利用者を対象としています。")
 
     show_cols = [
         "employee_code",
@@ -392,6 +535,13 @@ with tab2:
 # ---------------------------------------------------------
 with tab3:
     st.subheader("全体集計（月比較）")
+
+    if filter_by_tenure and tenure_days is not None and talent_df is not None:
+        st.caption(f"※ すべての月について、その月末時点で在籍{tenure_days}日以内の利用者のみを対象とした集計です。")
+    elif filter_by_tenure and tenure_days is not None and talent_df is None:
+        st.caption("※ タレントデータ未アップロードのため、実際には在籍日数フィルタは適用されていません。")
+    else:
+        st.caption("※ 在籍日数によるフィルタなしの全利用者を対象とした集計です。")
 
     # 月ごとの平均・中央値をまとめる
     summary_rows = []
