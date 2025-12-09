@@ -8,15 +8,14 @@ import numpy as np
 # ---------------------------------------------------------
 st.set_page_config(page_title="処理スコアダッシュボード📝", layout="wide")
 
-# ★ロゴ削除：タイトルだけ表示★
 st.title("処理スコアダッシュボード📝")
 
 st.markdown(
     """
 ### 使い方
-1. ①業務日報 ②業務割り振り ③案件管理 の3つのCSVをアップロード  
-2. 集計対象の月を選択  
-3. 各タブで「タスク別」「利用者別」「全体」を確認
+1. ①業務日報（複数月分OK） ②業務割り振り ③案件管理 のCSVをアップロード  
+2. 「詳細表示する月」で、タスク別 / 利用者別の表示対象の月を切り替え  
+3. 「全体集計」タブで、月ごとの処理スコアを比較
 """
 )
 
@@ -98,15 +97,55 @@ def calc_deviation_by_task(df, value_col, group_col="task_id"):
 
 
 # ---------------------------------------------------------
-# 全集計ロジック
+# 1ヶ月分の全集計ロジック
 # ---------------------------------------------------------
 def compute_all(report_df, assign_df, 案件_df, period_str):
+    """
+    report_df：複数月分を含む日報全体
+    period_str：'YYYY-MM' 形式の集計対象月
+    """
     df_rep = report_df.copy()
 
     # 日付処理
     df_rep["日付"] = pd.to_datetime(df_rep["日付"], errors="coerce")
     target_period = pd.to_datetime(period_str + "-01")
     df_rep = df_rep[df_rep["日付"].dt.to_period("M") == target_period.to_period("M")]
+
+    if df_rep.empty:
+        # 対象月にデータがない場合は空の結果を返す
+        empty_cols = ["employee_code", "user_name", "organization_name",
+                      "task_id", "task_name", "task_status",
+                      "案件種別", "業務グループ",
+                      "rank", "rank_value", "monthly_count",
+                      "deviation", "processing_score"]
+        base_empty = pd.DataFrame(columns=empty_cols)
+
+        user_empty = pd.DataFrame(
+            columns=[
+                "employee_code",
+                "user_name",
+                "organization_name",
+                "total_processing_score",
+                "task_ranks",
+                "user_rank",
+            ]
+        )
+
+        summary = {"overall_mean": np.nan, "overall_median": np.nan}
+        org_summary = pd.DataFrame(
+            columns=[
+                "organization_name",
+                "avg_score",
+                "user_count",
+                "ratio_A",
+                "ratio_B",
+                "ratio_C",
+                "ratio_D",
+                "ratio_E",
+            ]
+        )
+
+        return base_empty, user_empty, summary, org_summary
 
     # 日報の集計
     df_rep = df_rep[~df_rep["タスクID"].isna()]
@@ -214,40 +253,79 @@ def compute_all(report_df, assign_df, 案件_df, period_str):
 # ---------------------------------------------------------
 st.sidebar.header("1. CSVアップロード")
 
-report_file = st.sidebar.file_uploader("① 業務日報CSV", type=["csv"])
+# ★日報だけ複数ファイルを許可★
+report_files = st.sidebar.file_uploader(
+    "① 業務日報CSV（1ヶ月1ファイル・複数月分アップロード可）",
+    type=["csv"],
+    accept_multiple_files=True,
+)
 assign_file = st.sidebar.file_uploader("② 業務割り振りCSV", type=["csv"])
 案件_file = st.sidebar.file_uploader("③ 案件管理CSV", type=["csv"])
 
-if not (report_file and assign_file and 案件_file):
-    st.info("左のサイドバーから 3つのCSV をすべてアップロードしてください。")
+if not report_files or not assign_file or not 案件_file:
+    st.info("左のサイドバーから ①〜③ すべてのCSVをアップロードしてください。")
     st.stop()
 
-df_report = load_csv(report_file)
+# 日報複数ファイルを結合
+report_dfs = []
+for f in report_files:
+    df_tmp = load_csv(f)
+    if df_tmp is not None:
+        report_dfs.append(df_tmp)
+
+if not report_dfs:
+    st.error("業務日報CSVが読み込めませんでした。")
+    st.stop()
+
+df_report_all = pd.concat(report_dfs, ignore_index=True)
+
+# その他2つ
 df_assign = load_csv(assign_file)
 df_案件 = load_csv(案件_file)
 
-if df_report is None or df_assign is None or df_案件 is None:
+if df_assign is None or df_案件 is None:
     st.stop()
 
 # ---------------------------------------------------------
-# 集計対象月の選択
+# 利用可能な月一覧の取得
 # ---------------------------------------------------------
-df_report["日付"] = pd.to_datetime(df_report["日付"], errors="coerce")
-valid_dates = df_report["日付"].dropna()
+df_report_all["日付"] = pd.to_datetime(df_report_all["日付"], errors="coerce")
+valid_dates = df_report_all["日付"].dropna()
 
 if valid_dates.empty:
     st.error("日報の『日付』列が読み込めていません。CSVをご確認ください。")
     st.stop()
 
 periods = sorted(valid_dates.dt.to_period("M").astype(str).unique())
-selected_period = st.sidebar.selectbox("2. 集計対象の月", periods, index=len(periods)-1)
+
+# 詳細表示する月（タスク別・利用者別用）
+selected_period = st.sidebar.selectbox(
+    "2. 詳細表示する月（タスク別・利用者別）", periods, index=len(periods) - 1
+)
+
+st.sidebar.write("※ 全体集計タブでは、アップロードされたすべての月を比較表示します。")
 
 # ---------------------------------------------------------
-# 集計実行
+# 各月ごとの集計をまとめて計算
 # ---------------------------------------------------------
-base_df, user_df, summary, org_summary_df = compute_all(
-    df_report, df_assign, df_案件, selected_period
-)
+results_by_period = {}
+
+for p in periods:
+    base_df_p, user_df_p, summary_p, org_summary_p = compute_all(
+        df_report_all, df_assign, df_案件, p
+    )
+    results_by_period[p] = {
+        "base": base_df_p,
+        "user": user_df_p,
+        "summary": summary_p,
+        "org_summary": org_summary_p,
+    }
+
+# 表示用に、選択された月のデータを取り出す
+base_df = results_by_period[selected_period]["base"]
+user_df = results_by_period[selected_period]["user"]
+summary_selected = results_by_period[selected_period]["summary"]
+org_summary_selected = results_by_period[selected_period]["org_summary"]
 
 
 # ---------------------------------------------------------
@@ -260,7 +338,9 @@ tab1, tab2, tab3 = st.tabs(["タスク別処理状況", "利用者別集計", "�
 # タスク別
 # ---------------------------------------------------------
 with tab1:
-    st.subheader("タスク別処理状況")
+    st.subheader(f"タスク別処理状況（{selected_period}）")
+    st.caption("※ サイドバーの月選択で切り替えられます。")
+
     show_cols = [
         "employee_code",
         "user_name",
@@ -277,14 +357,20 @@ with tab1:
         "processing_score",
     ]
     show_cols = [c for c in show_cols if c in base_df.columns]
-    st.dataframe(base_df[show_cols].sort_values(["organization_name", "user_name", "task_id"]))
+    st.dataframe(
+        base_df[show_cols].sort_values(
+            ["organization_name", "user_name", "task_id"]
+        )
+    )
 
 
 # ---------------------------------------------------------
 # 利用者別
 # ---------------------------------------------------------
 with tab2:
-    st.subheader("利用者別 集計結果")
+    st.subheader(f"利用者別 集計結果（{selected_period}）")
+    st.caption("※ サイドバーの月選択で切り替えられます。")
+
     show_cols = [
         "employee_code",
         "user_name",
@@ -295,49 +381,72 @@ with tab2:
     ]
     st.dataframe(
         user_df[show_cols].sort_values(
-            ["organization_name", "total_processing_score"], ascending=[True, False]
+            ["organization_name", "total_processing_score"],
+            ascending=[True, False],
         )
     )
 
 
 # ---------------------------------------------------------
-# 全体集計
+# 全体集計（複数月比較）
 # ---------------------------------------------------------
 with tab3:
-    st.subheader(f"全体集計（{selected_period}）")
+    st.subheader("全体集計（月比較）")
 
-    col1, col2 = st.columns(2)
-    col1.metric("処理スコア 平均値", f"{summary['overall_mean']:.2f}")
-    col2.metric("処理スコア 中央値", f"{summary['overall_median']:.2f}")
+    # 月ごとの平均・中央値をまとめる
+    summary_rows = []
+    for p in periods:
+        s = results_by_period[p]["summary"]
+        summary_rows.append(
+            {
+                "month": p,
+                "mean_score": s["overall_mean"],
+                "median_score": s["overall_median"],
+            }
+        )
 
-    st.markdown("### 拠点別 集計")
+    summary_df = pd.DataFrame(summary_rows).sort_values("month")
 
-    display_cols = [
-        "organization_name",
-        "avg_score",
-        "user_count",
-        "ratio_A",
-        "ratio_B",
-        "ratio_C",
-        "ratio_D",
-        "ratio_E",
-    ]
-
-    df_disp = org_summary_df[display_cols].copy()
-    for c in ["ratio_A", "ratio_B", "ratio_C", "ratio_D", "ratio_E"]:
-        df_disp[c] = (df_disp[c] * 100).round(1)
-
-    df_disp = df_disp.rename(
-        columns={
-            "organization_name": "拠点",
-            "avg_score": "平均スコア",
-            "user_count": "利用者数",
-            "ratio_A": "A比率(%)",
-            "ratio_B": "B比率(%)",
-            "ratio_C": "C比率(%)",
-            "ratio_D": "D比率(%)",
-            "ratio_E": "E比率(%)",
-        }
+    st.markdown("#### 月別 処理スコア（平均値・中央値）")
+    st.dataframe(
+        summary_df.assign(
+            mean_score=lambda d: d["mean_score"].round(2),
+            median_score=lambda d: d["median_score"].round(2),
+        )
     )
 
-    st.dataframe(df_disp.sort_values("平均スコア", ascending=False))
+    st.markdown("#### 拠点別 集計（選択月）")
+    st.caption(f"※ 拠点別は現在選択中の月（{selected_period}）のみ表示")
+
+    if not org_summary_selected.empty:
+        display_cols = [
+            "organization_name",
+            "avg_score",
+            "user_count",
+            "ratio_A",
+            "ratio_B",
+            "ratio_C",
+            "ratio_D",
+            "ratio_E",
+        ]
+
+        df_disp = org_summary_selected[display_cols].copy()
+        for c in ["ratio_A", "ratio_B", "ratio_C", "ratio_D", "ratio_E"]:
+            df_disp[c] = (df_disp[c] * 100).round(1)
+
+        df_disp = df_disp.rename(
+            columns={
+                "organization_name": "拠点",
+                "avg_score": "平均スコア",
+                "user_count": "利用者数",
+                "ratio_A": "A比率(%)",
+                "ratio_B": "B比率(%)",
+                "ratio_C": "C比率(%)",
+                "ratio_D": "D比率(%)",
+                "ratio_E": "E比率(%)",
+            }
+        )
+
+        st.dataframe(df_disp.sort_values("平均スコア", ascending=False))
+    else:
+        st.info(f"{selected_period} の拠点別集計データがありません。")
